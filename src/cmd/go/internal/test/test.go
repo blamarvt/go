@@ -34,8 +34,8 @@ import (
 	"cmd/go/internal/cache"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/load"
-	"cmd/go/internal/str"
 	"cmd/go/internal/work"
+	"cmd/internal/str"
 	"cmd/internal/test2json"
 )
 

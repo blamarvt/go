@@ -35,7 +35,12 @@ func mkzdefaultcc(dir, file string) {
 		fmt.Fprintln(&buf)
 		fmt.Fprintf(&buf, "const DefaultPkgConfig = `%s`\n", defaultpkgconfig)
 		buf.WriteString(defaultCCFunc("DefaultCC", defaultcc))
+		buf.WriteString(defaultCCFunc("DefaultLn", defaultld))
 		buf.WriteString(defaultCCFunc("DefaultCXX", defaultcxx))
+		buf.WriteString(defaultToolchainCCFunc("DefaultToolchainLd", defaultld))
+		buf.WriteString(defaultToolchainCCFunc("DefaultToolchainAsm", defaultasm))
+		buf.WriteString(defaultToolchainCCFunc("DefaultToolchainCC", defaultcc))
+		buf.WriteString(defaultToolchainCCFunc("DefaultToolchainCXX", defaultcxx))
 		writefile(buf.String(), file, writeSkipSame)
 		return
 	}
@@ -47,7 +52,12 @@ func mkzdefaultcc(dir, file string) {
 	fmt.Fprintln(&buf)
 	fmt.Fprintf(&buf, "const defaultPkgConfig = `%s`\n", defaultpkgconfig)
 	buf.WriteString(defaultCCFunc("defaultCC", defaultcc))
+	buf.WriteString(defaultCCFunc("defaultLd", defaultcc))
 	buf.WriteString(defaultCCFunc("defaultCXX", defaultcxx))
+	buf.WriteString(defaultToolchainCCFunc("defaultToolchainLd", defaultld))
+	buf.WriteString(defaultToolchainCCFunc("defaultToolchainAsm", defaultasm))
+	buf.WriteString(defaultToolchainCCFunc("defaultToolchainCC", defaultcc))
+	buf.WriteString(defaultToolchainCCFunc("defaultToolchainCXX", defaultcxx))
 	writefile(buf.String(), file, writeSkipSame)
 }
 
@@ -68,6 +78,28 @@ func defaultCCFunc(name string, defaultcc map[string]string) string {
 	}
 	fmt.Fprintf(&buf, "\t}\n")
 	fmt.Fprintf(&buf, "\treturn %q\n", defaultcc[""])
+	fmt.Fprintf(&buf, "}\n")
+
+	return buf.String()
+}
+
+func defaultToolchainCCFunc(name string, defaultcc map[string]string) string {
+	var buf bytes.Buffer
+
+	fmt.Fprintf(&buf, "func %s(goos, goarch, toolchain string) string {\n", name)
+	fmt.Fprintf(&buf, "\tswitch goos+`/`+goarch+`/`+toolchain {\n")
+	var keys []string
+	for k := range defaultcc {
+		if k != "" {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(&buf, "\tcase %q:\n\t\treturn %q\n", k, defaultcc[k])
+	}
+	fmt.Fprintf(&buf, "\t}\n")
+	fmt.Fprintf(&buf, "\t\treturn %q\n", defaultcc[""])
 	fmt.Fprintf(&buf, "}\n")
 
 	return buf.String()

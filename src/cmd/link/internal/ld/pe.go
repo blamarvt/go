@@ -1053,11 +1053,21 @@ func initdynimport(ctxt *Link) *Dll {
 
 // peimporteddlls returns the gcc command line argument to link all imported
 // DLLs.
-func peimporteddlls() []string {
+func gccPeimporteddlls() []string {
 	var dlls []string
 
 	for d := dr; d != nil; d = d.next {
 		dlls = append(dlls, "-l"+strings.TrimSuffix(d.name, ".dll"))
+	}
+
+	return dlls
+}
+
+func msvcPeimporteddlls() []string {
+	var dlls []string
+
+	for d := dr; d != nil; d = d.next {
+		dlls = append(dlls, "/DEFAULTLIB:"+strings.TrimSuffix(d.name, ".dll")+".lib")
 	}
 
 	return dlls

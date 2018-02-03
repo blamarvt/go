@@ -41,7 +41,10 @@ var (
 	oldgoos          string
 	oldgoarch        string
 	exe              string
+	defaulttools     map[string]string
 	defaultcc        map[string]string
+	defaultld        map[string]string
+	defaultasm       map[string]string
 	defaultcxx       map[string]string
 	defaultcflags    string
 	defaultldflags   string
@@ -52,6 +55,13 @@ var (
 
 	vflag int // verbosity
 )
+
+// The known toolchains.
+var okgotoolchain = []string{
+	"gccgo",
+	"gc",
+	"msvc",
+}
 
 // The known architectures.
 var okgoarch = []string{
@@ -178,12 +188,24 @@ func xinit() {
 
 	gogcflags = os.Getenv("BOOT_GO_GCFLAGS")
 
-	cc, cxx := "gcc", "g++"
+	cc, cxx, msvccc, msvcasm64, msvcasm, msvcld := "gcc", "g++", "cl.exe", "ml64.exe", "ml.exe", "link.exe"
 	if defaultclang {
 		cc, cxx = "clang", "clang++"
 	}
-	defaultcc = compilerEnv("CC", cc)
-	defaultcxx = compilerEnv("CXX", cxx)
+	defaulttools = make(map[string]string)
+	defaulttools["GCC_CC"] = cc
+	defaulttools["GCC_CXX"] = cxx
+	defaulttools["GCC_LD"] = cc
+	defaulttools["GCC_ASM"] = cc
+	defaulttools["MSVC_CC"] = msvccc
+	defaulttools["MSVC_LD"] = msvcld
+	defaulttools["MSVC_ASM"] = msvcasm
+	defaulttools["MSVC_ASM64"] = msvcasm64
+	defaulttools["MSVC_CXX"] = msvccc
+	defaultcc = compilerEnv("CC", "", defaulttools)
+	defaultld = compilerEnv("LD", defaultcc[""], defaulttools)
+	defaultasm = compilerEnv("ASM", defaultcc[""], defaulttools)
+	defaultcxx = compilerEnv("CXX", "", defaulttools)
 
 	defaultcflags = os.Getenv("CFLAGS")
 	defaultldflags = os.Getenv("LDFLAGS")
@@ -240,8 +262,14 @@ func xinit() {
 // but is overridden by the following.
 // If gohostos=goos and gohostarch=goarch, then $CC_FOR_TARGET applies even for gohostos/gohostarch.
 // $CC_FOR_goos_goarch, if set, applies only to goos/goarch.
-func compilerEnv(envName, def string) map[string]string {
-	m := map[string]string{"": def}
+func compilerEnv(envName string, def string, defs map[string]string) map[string]string {
+	var defTool string
+	if def == "" {
+		defTool = defs["GCC_"+envName]
+	} else {
+		defTool = def
+	}
+	m := map[string]string{"": defTool}
 
 	if env := os.Getenv(envName); env != "" {
 		m[""] = env
@@ -261,6 +289,28 @@ func compilerEnv(envName, def string) map[string]string {
 		}
 	}
 
+	for _, goos := range okgoos {
+		for _, goarch := range okgoarch {
+			for _, gotc := range okgotoolchain {
+				if env := os.Getenv(envName + "_FOR_" + goos + "_" + goarch + "_" + gotc); env != "" {
+					m[goos+"/"+goarch+"/"+gotc] = env
+				}
+			}
+		}
+	}
+
+	// Setup defaults for msvc
+	switch envName {
+	case "CC", "CXX":
+		m["windows/386/msvc"] = defs["MSVC_"+envName]
+		m["windows/amd64/msvc"] = defs["MSVC_"+envName]
+	case "LD":
+		m["windows/386/msvc"] = defs["MSVC_"+envName]
+		m["windows/amd64/msvc"] = defs["MSVC_"+envName]
+	case "ASM":
+		m["windows/386/msvc"] = defs["MSVC_"+envName]
+		m["windows/amd64/msvc"] = defs["MSVC_"+envName+"64"]
+	}
 	return m
 }
 
@@ -1211,6 +1261,8 @@ func cmdbootstrap() {
 	}
 	xprintf("Building Go toolchain2 using go_bootstrap and Go toolchain1.\n")
 	os.Setenv("CC", compilerEnvLookup(defaultcc, goos, goarch))
+	os.Setenv("LD", compilerEnvLookup(defaultld, goos, goarch))
+	os.Setenv("ASM", compilerEnvLookup(defaultasm, goos, goarch))
 	goInstall(goBootstrap, append([]string{"-i"}, toolchain...)...)
 	if debug {
 		run("", ShowOutput|CheckExit, pathf("%s/compile", tooldir), "-V=full")
@@ -1276,6 +1328,8 @@ func cmdbootstrap() {
 		os.Setenv("GOOS", goos)
 		os.Setenv("GOARCH", goarch)
 		os.Setenv("CC", compilerEnvLookup(defaultcc, goos, goarch))
+		os.Setenv("LD", compilerEnvLookup(defaultld, goos, goarch))
+		os.Setenv("ASM", compilerEnvLookup(defaultasm, goos, goarch))
 		xprintf("Building packages and commands for target, %s/%s.\n", goos, goarch)
 	}
 	goInstall(goBootstrap, "std", "cmd")

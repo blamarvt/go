@@ -19,8 +19,8 @@ import (
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/load"
-	"cmd/go/internal/str"
 	"cmd/internal/objabi"
+	"cmd/internal/str"
 	"crypto/sha1"
 )
 
@@ -429,10 +429,16 @@ func (gcToolchain) ld(b *Builder, root *Action, out, importcfg, mainpkg string) 
 	// by the CXX environment variable or defaultCXX if CXX is not set.
 	// Else, use the CC environment variable and defaultCC as fallback.
 	var compiler []string
-	if cxx {
-		compiler = envList("CXX", cfg.DefaultCXX(cfg.Goos, cfg.Goarch))
+	if cfg.BuildToolchainName == "msvc" {
+		compiler, _ = msvcEnvList("LD", cfg.DefaultToolchainLd(cfg.Goos, cfg.Goarch, "msvc"))
+		ldflags = append(ldflags, "-toolchain=msvc")
+		ldflags = append(ldflags, "-rlocbss")
 	} else {
-		compiler = envList("CC", cfg.DefaultCC(cfg.Goos, cfg.Goarch))
+		if cxx {
+			compiler = envList("CXX", cfg.DefaultCXX(cfg.Goos, cfg.Goarch))
+		} else {
+			compiler = envList("CC", cfg.DefaultCC(cfg.Goos, cfg.Goarch))
+		}
 	}
 	ldflags = append(ldflags, "-buildmode="+ldBuildmode)
 	if root.buildID != "" {
@@ -488,6 +494,10 @@ func (gcToolchain) ldShared(b *Builder, root *Action, toplevelactions []*Action,
 		ldflags = append(ldflags, d.Package.ImportPath+"="+d.Target)
 	}
 	return b.run(root, ".", out, nil, cfg.BuildToolexec, base.Tool("link"), "-o", out, "-importcfg", importcfg, ldflags)
+}
+
+func (gcToolchain) ccasm(b *Builder, a *Action, ofile, cfile string) error {
+	return fmt.Errorf("%s: C source files not supported without cgo", mkAbs(a.Package.Dir, cfile))
 }
 
 func (gcToolchain) cc(b *Builder, a *Action, ofile, cfile string) error {

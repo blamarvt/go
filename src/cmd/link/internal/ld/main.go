@@ -67,20 +67,23 @@ var (
 	flagLibGCC     = flag.String("libgcc", "", "compiler support lib for internal linking; use \"none\" to disable")
 	flagTmpdir     = flag.String("tmpdir", "", "use `directory` for temporary files")
 
+	flagToolchain = flag.String("toolchain", "", "toolchain to be used for external linking")
+
 	flagExtld      = flag.String("extld", "", "use `linker` when linking in external mode")
 	flagExtldflags = flag.String("extldflags", "", "pass `flags` to external linker")
 	flagExtar      = flag.String("extar", "", "archive program for buildmode=c-archive")
 
-	flagA           = flag.Bool("a", false, "disassemble output")
-	FlagC           = flag.Bool("c", false, "dump call graph")
-	FlagD           = flag.Bool("d", false, "disable dynamic executable")
-	flagF           = flag.Bool("f", false, "ignore version mismatch")
-	flagG           = flag.Bool("g", false, "disable go package data checks")
-	flagH           = flag.Bool("h", false, "halt on error")
-	flagN           = flag.Bool("n", false, "dump symbol table")
-	FlagS           = flag.Bool("s", false, "disable symbol table")
-	flagU           = flag.Bool("u", false, "reject unsafe packages")
-	FlagW           = flag.Bool("w", false, "disable DWARF generation")
+	flagA = flag.Bool("a", false, "disassemble output")
+	FlagC = flag.Bool("c", false, "dump call graph")
+	FlagD = flag.Bool("d", false, "disable dynamic executable")
+	flagF = flag.Bool("f", false, "ignore version mismatch")
+	flagG = flag.Bool("g", false, "disable go package data checks")
+	flagH = flag.Bool("h", false, "halt on error")
+	flagN = flag.Bool("n", false, "dump symbol table")
+	FlagS = flag.Bool("s", false, "disable symbol table")
+	flagU = flag.Bool("u", false, "reject unsafe packages")
+	FlagW = flag.Bool("w", false, "disable DWARF generation")
+
 	Flag8           bool // use 64-bit addresses in symbol table
 	flagInterpreter = flag.String("I", "", "use `linker` as ELF dynamic linker")
 	FlagDebugTramp  = flag.Int("debugtramp", 0, "debug trampolines")
@@ -89,6 +92,8 @@ var (
 	FlagTextAddr    = flag.Int64("T", -1, "set text segment `address`")
 	FlagDataAddr    = flag.Int64("D", -1, "set data segment `address`")
 	flagEntrySymbol = flag.String("E", "", "set `entry` symbol name")
+
+	flagRlocbss = flag.Bool("rlocbss", false, "relocate .bss to .data")
 
 	cpuprofile     = flag.String("cpuprofile", "", "write cpu profile to `file`")
 	memprofile     = flag.String("memprofile", "", "write memory profile to `file`")
@@ -226,7 +231,7 @@ func Main(arch *sys.Arch, theArch Arch) {
 	ctxt.reloc()
 	Thearch.Asmb(ctxt)
 	ctxt.undef()
-	ctxt.hostlink()
+	ctxt.toolchainHostlink()
 	ctxt.archive()
 	if ctxt.Debugvlog != 0 {
 		ctxt.Logf("%5.2f cpu time\n", Cputime())

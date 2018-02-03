@@ -37,12 +37,33 @@ var (
 	BuildWork              bool // -work flag
 	BuildX                 bool // -x flag
 
+	SupportedToolchains Toolchains = Toolchains{all: []string{"gcc", "gccgo", "msvc"}}
+
 	CmdName string // "build", "install", "list", etc.
 
 	DebugActiongraph string // -debug-actiongraph flag (undocumented, unstable)
 )
 
+type Toolchains struct {
+	names []string
+	all   []string
+}
+
+func (t Toolchains) Filter(value string) (res []string) {
+	for _, p := range t.all {
+		if p != value {
+			res = append(res, p)
+		}
+	}
+	return res
+}
+
 func init() {
+	if runtime.GOOS == "windows" {
+		SupportedToolchains.names = []string{"gcc", "gccgo", "msvc"}
+	} else {
+		SupportedToolchains.names = []string{"gcc", "gccgo"}
+	}
 	BuildToolchainCompiler = func() string { return "missing-compiler" }
 	BuildToolchainLinker = func() string { return "missing-linker" }
 }

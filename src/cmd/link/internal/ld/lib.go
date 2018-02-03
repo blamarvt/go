@@ -34,6 +34,7 @@ import (
 	"bufio"
 	"bytes"
 	"cmd/internal/bio"
+	"cmd/internal/msvc"
 	"cmd/internal/objabi"
 	"cmd/internal/sys"
 	"cmd/link/internal/loadelf"
@@ -1038,11 +1039,13 @@ func (ctxt *Link) archive() {
 
 	// Force the buffer to flush here so that external
 	// tools will see a complete file.
-	ctxt.Out.Flush()
-	if err := ctxt.Out.f.Close(); err != nil {
-		Exitf("close: %v", err)
+	if ctxt.Out.f != nil {
+		ctxt.Out.Flush()
+		if err := ctxt.Out.f.Close(); err != nil {
+			Exitf("close: %v", err)
+		}
+		ctxt.Out.f = nil
 	}
-	ctxt.Out.f = nil
 
 	argv := []string{*flagExtar, "-q", "-c", "-s", *flagOutfile}
 	argv = append(argv, filepath.Join(*flagTmpdir, "go.o"))
@@ -1057,7 +1060,15 @@ func (ctxt *Link) archive() {
 	}
 }
 
-func (ctxt *Link) hostlink() {
+func (ctxt *Link) toolchainHostlink() {
+	if *flagToolchain == "msvc" {
+		ctxt.msvcHostlink()
+	} else {
+		ctxt.gccHostlink()
+	}
+}
+
+func (ctxt *Link) gccHostlink() {
 	if ctxt.LinkMode != LinkExternal || nerrors > 0 {
 		return
 	}
@@ -1312,7 +1323,7 @@ func (ctxt *Link) hostlink() {
 		// libmingw32 and libmingwex have some inter-dependencies,
 		// so must use linker groups.
 		argv = append(argv, "-Wl,--start-group", "-lmingwex", "-lmingw32", "-Wl,--end-group")
-		argv = append(argv, peimporteddlls()...)
+		argv = append(argv, gccPeimporteddlls()...)
 	}
 
 	if ctxt.Debugvlog != 0 {
@@ -1353,6 +1364,154 @@ func (ctxt *Link) hostlink() {
 			}
 		}
 	}
+}
+
+func (ctxt *Link) msvcHostlink() {
+	if ctxt.LinkMode != LinkExternal || nerrors > 0 {
+		return
+	}
+	if ctxt.BuildMode == BuildModeCArchive {
+		return
+	}
+
+	if *flagExtld == "" {
+		*flagExtld = "link.exe"
+	}
+
+	var argv []string
+	argv = append(argv, *flagExtld)
+
+	if windowsgui {
+		argv = append(argv, "/SUBSYSTEM:WINDOWS")
+	} else {
+		argv = append(argv, "/SUBSYSTEM:CONSOLE")
+	}
+
+	// On Windows, given -o foo, GCC will append ".exe" to produce
+	// "foo.exe".  We have decided that we want to honor the -o
+	// option. To make this work, we append a '.' so that GCC
+	// will decide that the file already has an extension. We
+	// only want to do this when producing a Windows output file
+	// on a Windows host.
+	outopt := *flagOutfile
+
+	argv = append(argv, "/out:"+outopt)
+
+	argv = append(argv, filepath.Join(*flagTmpdir, "go.o"))
+	argv = append(argv, hostobjCopy()...)
+
+	if ctxt.linkShared {
+		seenDirs := make(map[string]bool)
+		seenLibs := make(map[string]bool)
+		addshlib := func(path string) {
+			dir, base := filepath.Split(path)
+			if !seenDirs[dir] {
+				argv = append(argv, "-L"+dir)
+				if !rpath.set {
+					argv = append(argv, "-Wl,-rpath="+dir)
+				}
+				seenDirs[dir] = true
+			}
+			base = strings.TrimSuffix(base, ".so")
+			base = strings.TrimPrefix(base, "lib")
+			if !seenLibs[base] {
+				argv = append(argv, "-l"+base)
+				seenLibs[base] = true
+			}
+		}
+		for _, shlib := range ctxt.Shlibs {
+			addshlib(shlib.Path)
+			for _, dep := range shlib.Deps {
+				if dep == "" {
+					continue
+				}
+				libpath := findshlib(ctxt, dep)
+				if libpath != "" {
+					addshlib(libpath)
+				}
+			}
+		}
+	}
+
+	argv = append(argv, ldflag...)
+	defaultLib := false
+	for _, p := range strings.Fields(*flagExtldflags) {
+		switch p {
+		case "/MD":
+			argv = append(argv, "/DEFAULTLIB:msvcrt.lib")
+			defaultLib = true
+		case "/MDd":
+			argv = append(argv, "/DEFAULTLIB:msvcrtd.lib")
+			defaultLib = true
+		case "/ML":
+			argv = append(argv, "/DEFAULTLIB:LIBC.lib")
+			defaultLib = true
+		case "/MT":
+			argv = append(argv, "/DEFAULTLIB:libcmt.lib")
+			defaultLib = true
+		case "/Mtd":
+			argv = append(argv, "/DEFAULTLIB:libcmtd.lib")
+			defaultLib = true
+		}
+		argv = append(argv, p)
+	}
+	argv = append(argv, msvcPeimporteddlls()...)
+	if !defaultLib {
+		argv = append(argv, "/DEFAULTLIB:msvcrt.lib")
+	}
+	if ctxt.Debugvlog != 0 {
+		ctxt.Logf("%5.2f host link:", Cputime())
+		for _, v := range argv {
+			ctxt.Logf(" %q", v)
+		}
+		ctxt.Logf("\n")
+	}
+
+	// MSVC Link will not link against an open file...
+	ctxt.Out.Flush()
+	if err := ctxt.Out.f.Close(); err != nil {
+		Exitf("close: %v", err)
+	}
+	ctxt.Out.f = nil
+
+	var envs []string
+
+	msvcEnvironment, err := msvc.FromCommand(argv[0])
+
+	if err == nil {
+		includes, _ := msvcEnvironment.LocateIncludes(strings.Replace(strings.Replace(objabi.GOARCH, "amd64", "x64", -1), "386", "x86", -1))
+		libs, _ := msvcEnvironment.LocateLibs(strings.Replace(strings.Replace(objabi.GOARCH, "amd64", "x64", -1), "386", "x86", -1))
+		libpath, _ := msvcEnvironment.LocateLibPaths(strings.Replace(strings.Replace(objabi.GOARCH, "amd64", "x64", -1), "386", "x86", -1))
+		envs = []string{"INCLUDE=" + strings.Join(includes, ";"), "LIB=" + strings.Join(libs, ";"), "LIBPATH=" + strings.Join(libpath, ";")}
+	} else {
+		Exitf("running %s failed: %v\n", argv[0], err)
+		return
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Env = MergeEnvLists(envs, os.Environ())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		Exitf("running %s failed: %v\n%s", argv[0], err, out)
+	} else if len(out) > 0 {
+		// always print external output even if the command is successful, so that we don't
+		// swallow linker warnings (see https://golang.org/issue/17935).
+		ctxt.Logf("%s", out)
+	}
+}
+
+func MergeEnvLists(in, out []string) []string {
+	out = append([]string(nil), out...)
+NextVar:
+	for _, inkv := range in {
+		k := strings.SplitAfterN(inkv, "=", 2)[0]
+		for i, outkv := range out {
+			if strings.HasPrefix(outkv, k) {
+				out[i] = inkv
+				continue NextVar
+			}
+		}
+		out = append(out, inkv)
+	}
+	return out
 }
 
 // hostlinkArchArgs returns arguments to pass to the external linker

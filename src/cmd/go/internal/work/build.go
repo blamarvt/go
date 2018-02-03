@@ -182,6 +182,8 @@ func (c buildCompiler) Set(value string) error {
 		BuildToolchain = gcToolchain{}
 	case "gccgo":
 		BuildToolchain = gccgoToolchain{}
+	case "msvc":
+		BuildToolchain = gcToolchain{}
 	default:
 		return fmt.Errorf("unknown compiler %q", value)
 	}

@@ -28,7 +28,8 @@ import (
 	"cmd/go/internal/cache"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/load"
-	"cmd/go/internal/str"
+	"cmd/internal/msvc"
+	"cmd/internal/str"
 )
 
 // actionList returns the list of actions in the dag rooted at root
@@ -215,7 +216,7 @@ func (b *Builder) buildActionID(a *Action) cache.ActionID {
 	switch cfg.BuildToolchainName {
 	default:
 		base.Fatalf("buildActionID: unknown build toolchain %q", cfg.BuildToolchainName)
-	case "gc":
+	case "gc", "msvc":
 		fmt.Fprintf(h, "compile %s %q %q\n", b.toolID("compile"), forcedGcflags, p.Internal.Gcflags)
 		if len(p.SFiles) > 0 {
 			fmt.Fprintf(h, "asm %q %q %q\n", b.toolID("asm"), forcedAsmflags, p.Internal.Asmflags)
@@ -252,7 +253,6 @@ func (b *Builder) buildActionID(a *Action) cache.ActionID {
 			// essentially unfindable.
 			fmt.Fprintf(h, "nocache %d\n", time.Now().UnixNano())
 		}
-
 	case "gccgo":
 		id, err := b.gccgoToolID(BuildToolchain.compiler(), "go")
 		if err != nil {
@@ -381,6 +381,14 @@ func (b *Builder) build(a *Action) (err error) {
 			return err
 		}
 	}
+	if cfg.BuildToolchainName == "msvc" {
+		if b.msvcEnvironment == nil {
+			b.loadMsvcEnvironment()
+			if b.msvcEnvironment == nil {
+				return fmt.Errorf("Could not find a valid environment to build with the msvc toolchain")
+			}
+		}
+	}
 
 	var gofiles, cgofiles, cfiles, sfiles, cxxfiles, objects, cgoObjects, pcCFLAGS, pcLDFLAGS []string
 
@@ -450,21 +458,40 @@ func (b *Builder) build(a *Action) (err error) {
 		// cgo and non-cgo worlds, so it necessarily has files in both.
 		// In that case gcc only gets the gcc_* files.
 		var gccfiles []string
-		gccfiles = append(gccfiles, cfiles...)
-		cfiles = nil
 		if a.Package.Standard && a.Package.ImportPath == "runtime/cgo" {
-			filter := func(files, nongcc, gcc []string) ([]string, []string) {
+			filterCombine := func(files, gccfiles, nongcc, gcc []string, prefix string, exclude []string) ([]string, []string) {
+				for _, f := range gccfiles {
+					if strings.HasPrefix(f, prefix) {
+						gcc = append(gcc, f)
+					}
+				}
 				for _, f := range files {
-					if strings.HasPrefix(f, "gcc_") {
+					if strings.HasPrefix(f, prefix) {
 						gcc = append(gcc, f)
 					} else {
-						nongcc = append(nongcc, f)
+						valid := true
+						for _, exclusion := range exclude {
+							if strings.HasPrefix(f, exclusion+"_") {
+								valid = false
+								break
+							}
+						}
+						if valid {
+							nongcc = append(nongcc, f)
+						}
 					}
 				}
 				return nongcc, gcc
 			}
-			sfiles, gccfiles = filter(sfiles, sfiles[:0], gccfiles)
+			if cfg.BuildToolchainName != "msvc" {
+				sfiles, gccfiles = filterCombine(sfiles, cfiles, sfiles[:0], gccfiles, "gcc_", cfg.SupportedToolchains.Filter("gcc"))
+			} else {
+				sfiles, gccfiles = filterCombine(sfiles, cfiles, sfiles[:0], gccfiles, "msvc_", cfg.SupportedToolchains.Filter("msvc"))
+			}
+			cfiles = nil
 		} else {
+			gccfiles = append(gccfiles, cfiles...)
+			cfiles = nil
 			for _, sfile := range sfiles {
 				data, err := ioutil.ReadFile(filepath.Join(a.Package.Dir, sfile))
 				if err == nil {
@@ -783,7 +810,7 @@ func (b *Builder) printLinkerConfig(h io.Writer, p *load.Package) {
 	default:
 		base.Fatalf("linkActionID: unknown toolchain %q", cfg.BuildToolchainName)
 
-	case "gc":
+	case "gc", "msvc":
 		fmt.Fprintf(h, "link %s %q %s\n", b.toolID("link"), forcedLdflags, ldBuildmode)
 		if p != nil {
 			fmt.Fprintf(h, "linkflags %q\n", p.Internal.Ldflags)
@@ -1465,7 +1492,6 @@ func (b *Builder) runOut(dir string, desc string, env []string, cmdargs ...inter
 			return nil, nil
 		}
 	}
-
 	var buf bytes.Buffer
 	cmd := exec.Command(cmdline[0], cmdline[1:]...)
 	cmd.Stdout = &buf
@@ -1567,6 +1593,9 @@ type toolchain interface {
 	// cc runs the toolchain's C compiler in a directory on a C file
 	// to produce an output file.
 	cc(b *Builder, a *Action, ofile, cfile string) error
+	// cc runs the toolchain's C/Asm compiler in a directory on a Asm file
+	// to produce an output file.
+	ccasm(b *Builder, a *Action, ofile, cfile string) error
 	// asm runs the assembler in a specific directory on specific files
 	// and returns a list of named output files.
 	asm(b *Builder, a *Action, sfiles []string) ([]string, error)
@@ -1620,13 +1649,42 @@ func (noToolchain) ldShared(b *Builder, root *Action, toplevelactions []*Action,
 	return noCompiler()
 }
 
+func (noToolchain) ccasm(b *Builder, a *Action, ofile, cfile string) error {
+	return noCompiler()
+}
+
 func (noToolchain) cc(b *Builder, a *Action, ofile, cfile string) error {
 	return noCompiler()
+}
+
+// toolchainCc runs the toolchain C compiler to create an object from a single C file.
+func (b *Builder) toolchainCc(a *Action, p *load.Package, workdir, out string, flags []string, cfile string) error {
+	if cfg.BuildToolchainName == "msvc" {
+		return b.msvccc(a, p, workdir, out, flags, cfile)
+	}
+	return b.gcc(a, p, workdir, out, flags, cfile)
+}
+
+// toolchainGxx runs the toolchain C compiler to create an object from a single C++ file.
+func (b *Builder) toolchainGxx(a *Action, p *load.Package, workdir, out string, flags []string, cfile string) error {
+	if cfg.BuildToolchainName == "msvc" {
+		return b.msvccc(a, p, workdir, out, flags, cfile)
+	}
+	return b.gxx(a, p, workdir, out, flags, cfile)
 }
 
 // gcc runs the gcc C compiler to create an object from a single C file.
 func (b *Builder) gcc(a *Action, p *load.Package, workdir, out string, flags []string, cfile string) error {
 	return b.ccompile(a, p, out, flags, cfile, b.GccCmd(p.Dir, workdir))
+}
+
+// gcc runs the msvc C compiler to create an object from a single C file.
+func (b *Builder) msvccc(a *Action, p *load.Package, workdir, out string, flags []string, cfile string) error {
+	if strings.HasSuffix(strings.ToLower(cfile), ".s") {
+		return b.msvcassemble(a, p, out, flags, cfile, b.MsvcAsmCmd(p.Dir, workdir))
+	} else {
+		return b.msvccompile(a, p, out, flags, cfile, b.MsvcCcCmd(p.Dir, workdir))
+	}
 }
 
 // gxx runs the g++ C++ compiler to create an object from a single C++ file.
@@ -1678,6 +1736,86 @@ func (b *Builder) ccompile(a *Action, p *load.Package, outfile string, flags []s
 	return err
 }
 
+// msvccompile runs the given C or C++ compiler and creates an object from a single source file.
+func (b *Builder) msvccompile(a *Action, p *load.Package, outfile string, flags []string, file string, compiler []string) error {
+	file = mkAbs(p.Dir, file)
+	desc := p.ImportPath
+	if !filepath.IsAbs(outfile) {
+		outfile = filepath.Join(p.Dir, outfile)
+	}
+	var envs []string
+
+	if b.msvcEnvironment != nil {
+		includes, _ := b.msvcEnvironment.LocateIncludes(strings.Replace(strings.Replace(cfg.Goarch, "amd64", "x64", -1), "386", "x86", -1))
+		libs, _ := b.msvcEnvironment.LocateLibs(strings.Replace(strings.Replace(cfg.Goarch, "amd64", "x64", -1), "386", "x86", -1))
+		libpath, _ := b.msvcEnvironment.LocateLibPaths(strings.Replace(strings.Replace(cfg.Goarch, "amd64", "x64", -1), "386", "x86", -1))
+		envs = []string{"INCLUDE=" + strings.Join(includes, ";"), "LIB=" + strings.Join(libs, ";"), "LIBPATH=" + strings.Join(libpath, ";")}
+	}
+	// TODO enable debugging information?
+	//flags = str.StringList(flags, "/Zi")
+	staticSet := false
+	for _, p := range flags {
+		if p == "/ML" || p == "/MLd" || p == "/MT" || p == "/MTd" || p == "/MDd" {
+			staticSet = true
+		}
+	}
+	if !staticSet {
+		flags = str.StringList(flags, "/MD")
+	}
+	output, err := b.runOut(filepath.Dir(file), desc, envs, compiler, flags, "/Fo"+outfile, "/Tc"+filepath.Base(file))
+	if len(output) > 0 {
+		headerless := b.stripMsvcHeader(output, filepath.Base(file))
+		if len(headerless) > 0 {
+			b.showOutput(a, p.Dir, desc, b.processOutput(output))
+			if err != nil {
+				err = errPrintedOutput
+			} else if os.Getenv("GO_BUILDER_NAME") != "" {
+				return errors.New("C compiler warning promoted to error on Go builders")
+			}
+		}
+	}
+	return err
+}
+
+// msvcassemble runs the given asm and creates an object from a single source file.
+func (b *Builder) msvcassemble(a *Action, p *load.Package, outfile string, flags []string, file string, compiler []string) error {
+	file = mkAbs(p.Dir, file)
+	desc := p.ImportPath
+	if !filepath.IsAbs(outfile) {
+		outfile = filepath.Join(p.Dir, outfile)
+	}
+	var envs []string
+	if b.msvcEnvironment != nil {
+		includes, _ := b.msvcEnvironment.LocateIncludes(strings.Replace(strings.Replace(cfg.Goarch, "amd64", "x64", -1), "386", "x86", -1))
+		libs, _ := b.msvcEnvironment.LocateLibs(strings.Replace(strings.Replace(cfg.Goarch, "amd64", "x64", -1), "386", "x86", -1))
+		libpath, _ := b.msvcEnvironment.LocateLibPaths(strings.Replace(strings.Replace(cfg.Goarch, "amd64", "x64", -1), "386", "x86", -1))
+		envs = []string{"INCLUDE=" + strings.Join(includes, ";"), "LIB=" + strings.Join(libs, ";"), "LIBPATH=" + strings.Join(libpath, ";")}
+	}
+
+	flags = []string{"/c", "/Cx", "/Zi"}
+	output, err := b.runOut(filepath.Dir(file), desc, envs, compiler, flags, "/Fo"+outfile, filepath.Base(file))
+	if len(output) > 0 {
+		headerless := b.stripMsvcHeader(output, filepath.Base(file))
+		if len(headerless) > 0 {
+			b.showOutput(a, p.Dir, desc, b.processOutput(output))
+			if err != nil {
+				err = errPrintedOutput
+			} else if os.Getenv("GO_BUILDER_NAME") != "" {
+				return errors.New("C compiler warning promoted to error on Go builders")
+			}
+		}
+	}
+	return err
+}
+
+// toolchainLd runs the toolchain linker to create an executable from a set of object files.
+func (b *Builder) toolchainLd(p *load.Package, objdir, out string, flags []string, objs []string) error {
+	if cfg.BuildToolchainName == "msvc" {
+		return b.msvcld(p, objdir, out, flags, objs)
+	}
+	return b.gccld(p, objdir, out, flags, objs)
+}
+
 // gccld runs the gcc linker to create an executable from a set of object files.
 func (b *Builder) gccld(p *load.Package, objdir, out string, flags []string, objs []string) error {
 	var cmd []string
@@ -1689,37 +1827,90 @@ func (b *Builder) gccld(p *load.Package, objdir, out string, flags []string, obj
 	return b.run(nil, p.Dir, p.ImportPath, nil, cmd, "-o", out, objs, flags)
 }
 
+// msvcld runs the msvc linker to create an executable from a set of object files.
+func (b *Builder) msvcld(p *load.Package, objdir, out string, flags []string, objs []string) error {
+	var cmd []string
+	cmd = b.MsvcLinkCmd(p.Dir, objdir)
+	flags = []string{}
+	var envs []string
+
+	if b.msvcEnvironment != nil {
+		includes, _ := b.msvcEnvironment.LocateIncludes(strings.Replace(strings.Replace(cfg.Goarch, "amd64", "x64", -1), "386", "x86", -1))
+		libs, _ := b.msvcEnvironment.LocateLibs(strings.Replace(strings.Replace(cfg.Goarch, "amd64", "x64", -1), "386", "x86", -1))
+		libpath, _ := b.msvcEnvironment.LocateLibPaths(strings.Replace(strings.Replace(cfg.Goarch, "amd64", "x64", -1), "386", "x86", -1))
+		envs = []string{"INCLUDE=" + strings.Join(includes, ";"), "LIB=" + strings.Join(libs, ";"), "LIBPATH=" + strings.Join(libpath, ";")}
+	}
+	output, err := b.runOut(p.Dir, p.ImportPath, envs, cmd, "/OUT:"+out, objs, flags)
+	if len(out) > 0 {
+		headerless := b.stripMsvcHeader(output, "x")
+		if len(headerless) > 0 {
+			b.showOutput(nil, p.Dir, p.ImportPath, b.processOutput(output))
+			if err != nil {
+				err = errPrintedOutput
+			}
+		}
+	}
+	return err
+}
+
 // Grab these before main helpfully overwrites them.
 var (
 	origCC  = os.Getenv("CC")
+	origLd  = os.Getenv("LD")
+	origAsm = os.Getenv("ASM")
 	origCXX = os.Getenv("CXX")
 )
 
 // gccCmd returns a gcc command line prefix
 // defaultCC is defined in zdefaultcc.go, written by cmd/dist.
 func (b *Builder) GccCmd(incdir, workdir string) []string {
-	return b.compilerCmd(b.ccExe(), incdir, workdir)
+	return b.gccCompilerCmd(b.ccExe(), incdir, workdir)
+}
+
+// MsvcCcCmd returns a msvc cc command line prefix
+func (b *Builder) MsvcCcCmd(incdir, workdir string) []string {
+	return b.msvcCompilerCmd(b.ccExe(), incdir, workdir)
+}
+
+// MsvcAsmCmd returns a msvc asm command line prefix
+func (b *Builder) MsvcAsmCmd(incdir, workdir string) []string {
+	return b.msvcAssemblerCmd(b.asmExe(), incdir, workdir)
+}
+
+// MsvcLinkCmd returns a msvc link command line prefix
+func (b *Builder) MsvcLinkCmd(incdir, workdir string) []string {
+	return b.msvcLinkCmd(b.ldExe(), incdir, workdir)
 }
 
 // gxxCmd returns a g++ command line prefix
 // defaultCXX is defined in zdefaultcc.go, written by cmd/dist.
 func (b *Builder) GxxCmd(incdir, workdir string) []string {
-	return b.compilerCmd(b.cxxExe(), incdir, workdir)
+	return b.gccCompilerCmd(b.cxxExe(), incdir, workdir)
 }
 
 // gfortranCmd returns a gfortran command line prefix.
 func (b *Builder) gfortranCmd(incdir, workdir string) []string {
-	return b.compilerCmd(b.fcExe(), incdir, workdir)
+	return b.gccCompilerCmd(b.fcExe(), incdir, workdir)
 }
 
 // ccExe returns the CC compiler setting without all the extra flags we add implicitly.
 func (b *Builder) ccExe() []string {
-	return b.compilerExe(origCC, cfg.DefaultCC(cfg.Goos, cfg.Goarch))
+	return b.compilerExe(origCC, cfg.DefaultToolchainCC(cfg.Goos, cfg.Goarch, cfg.BuildToolchainName))
+}
+
+// asmExe returns the Assember setting without all the extra flags we add implicitly.
+func (b *Builder) asmExe() []string {
+	return b.compilerExe(origAsm, cfg.DefaultToolchainAsm(cfg.Goos, cfg.Goarch, cfg.BuildToolchainName))
+}
+
+// ldExe returns the Linker setting without all the extra flags we add implicitly.
+func (b *Builder) ldExe() []string {
+	return b.compilerExe(origLd, cfg.DefaultToolchainLd(cfg.Goos, cfg.Goarch, cfg.BuildToolchainName))
 }
 
 // cxxExe returns the CXX compiler setting without all the extra flags we add implicitly.
 func (b *Builder) cxxExe() []string {
-	return b.compilerExe(origCXX, cfg.DefaultCXX(cfg.Goos, cfg.Goarch))
+	return b.compilerExe(origCXX, cfg.DefaultToolchainCXX(cfg.Goos, cfg.Goarch, cfg.BuildToolchainName))
 }
 
 // fcExe returns the FC compiler setting without all the extra flags we add implicitly.
@@ -1734,16 +1925,22 @@ func (b *Builder) fcExe() []string {
 // were present in the environment value.
 // For example if CC="gcc -DGOPHER" then the result is ["gcc", "-DGOPHER"].
 func (b *Builder) compilerExe(envValue string, def string) []string {
-	compiler := strings.Fields(envValue)
+	compiler, _ := str.SplitQuotedFields(envValue)
 	if len(compiler) == 0 {
 		compiler = []string{def}
+	}
+	if cfg.BuildToolchainName != "msvc" {
+		if b.msvcEnvironment != nil {
+			compiler[0] = b.msvcEnvironment.GetMSVCCommand(compiler[0])
+			return compiler
+		}
 	}
 	return compiler
 }
 
-// compilerCmd returns a command line prefix for the given environment
+// gccCompilerCmd returns a command line prefix for the given environment
 // variable and using the default command when the variable is empty.
-func (b *Builder) compilerCmd(compiler []string, incdir, workdir string) []string {
+func (b *Builder) gccCompilerCmd(compiler []string, incdir, workdir string) []string {
 	// NOTE: env.go's mkEnv knows that the first three
 	// strings returned are "gcc", "-I", incdir (and cuts them off).
 	a := []string{compiler[0], "-I", incdir}
@@ -1803,6 +2000,35 @@ func (b *Builder) compilerCmd(compiler []string, incdir, workdir string) []strin
 	return a
 }
 
+// msvcCompilerCmd returns a command line prefix for the given environment
+// variable and using the default command when the variable is empty.
+func (b *Builder) msvcCompilerCmd(compiler []string, incdir, workdir string) []string {
+	// NOTE: env.go's mkEnv knows that the first three
+	// strings returned are "gcc", "-I", incdir (and cuts them off).
+	a := []string{compiler[0], "/I", incdir}
+	a = append(a, compiler[1:]...)
+
+	return a
+}
+
+// msvcLinkCmd returns a command line prefix for the given environment
+// variable and using the default command when the variable is empty.
+func (b *Builder) msvcLinkCmd(compiler []string, incdir, workdir string) []string {
+	// NOTE: env.go's mkEnv knows that the first three
+	// strings returned are "gcc", "-I", incdir (and cuts them off).
+	a := compiler
+	return a
+}
+
+// msvcAssemblerCmd returns a command line prefix for the given environment
+// variable and using the default command when the variable is empty.
+func (b *Builder) msvcAssemblerCmd(compiler []string, incdir, workdir string) []string {
+	// NOTE: env.go's mkEnv knows that the first three
+	// strings returned are "gcc", "-I", incdir (and cuts them off).
+	a := compiler
+	return a
+}
+
 // gccNoPie returns the flag to use to request non-PIE. On systems
 // with PIE (position independent executables) enabled by default,
 // -no-pie must be passed when doing a partial link with -Wl,-r.
@@ -1815,6 +2041,45 @@ func (b *Builder) gccNoPie(linker []string) string {
 		return "-nopie"
 	}
 	return ""
+}
+
+func (b *Builder) stripMsvcHeader(output []byte, filename string) []byte {
+	var headerless []byte
+	headerless = output
+	if idx := bytes.Index(headerless, []byte("Microsoft (R) C/C++ Optimizing Compiler")); idx == 0 {
+		headerless = headerless[bytes.Index(output, []byte("\n"))+1:]
+	}
+	if idx := bytes.Index(headerless, []byte("Microsoft (R) Incremental Linker Version")); idx == 0 {
+		headerless = headerless[bytes.Index(headerless, []byte("\n"))+1:]
+	}
+	if idx := bytes.Index(headerless, []byte("Assembling: "+filename)); idx == 0 {
+		headerless = headerless[bytes.Index(headerless, []byte("\n"))+1:]
+	}
+	if idx := bytes.Index(headerless, []byte(" Assembling: "+filename)); idx == 0 {
+		headerless = headerless[bytes.Index(headerless, []byte("\n"))+1:]
+	}
+	if idx := bytes.Index(headerless, []byte("\r\n")); idx == 0 {
+		headerless = headerless[bytes.Index(headerless, []byte("\n"))+1:]
+	}
+	if idx := bytes.Index(headerless, []byte("\n")); idx == 0 {
+		headerless = headerless[bytes.Index(headerless, []byte("\n"))+1:]
+	}
+	if idx := bytes.Index(headerless, []byte("Microsoft (R) Macro Assembler")); idx == 0 {
+		headerless = headerless[bytes.Index(headerless, []byte("\n"))+1:]
+	}
+	if idx := bytes.Index(headerless, []byte("Copyright (C) Microsoft Corporation.  All rights reserved.")); idx == 0 {
+		headerless = headerless[bytes.Index(headerless, []byte("\n"))+1:]
+	}
+	if idx := bytes.Index(headerless, []byte("\r\n")); idx == 0 {
+		headerless = headerless[bytes.Index(headerless, []byte("\n"))+1:]
+	}
+	if idx := bytes.Index(headerless, []byte("\n")); idx == 0 {
+		headerless = headerless[bytes.Index(headerless, []byte("\n"))+1:]
+	}
+	if idx := bytes.Index(headerless, []byte(filepath.Base(filename))); idx == 0 {
+		headerless = headerless[bytes.Index(headerless, []byte("\n"))+1:]
+	}
+	return headerless
 }
 
 // gccSupportsFlag checks to see if the compiler supports a flag.
@@ -1877,6 +2142,25 @@ func (b *Builder) gccArchArgs() []string {
 	return nil
 }
 
+func (b *Builder) loadMsvcEnvironment() {
+	cmds := []string{
+		origCC,
+		cfg.DefaultToolchainCC(cfg.Goos, cfg.Goarch, cfg.BuildToolchainName),
+		origLd,
+		cfg.DefaultToolchainLd(cfg.Goos, cfg.Goarch, cfg.BuildToolchainName),
+		origAsm,
+		cfg.DefaultToolchainAsm(cfg.Goos, cfg.Goarch, cfg.BuildToolchainName),
+	}
+	for _, cmd := range cmds {
+		msvcEnv, err := msvc.FromCommand(cmd)
+		if err == nil {
+			b.msvcEnvironment = msvcEnv
+			return
+		}
+	}
+	// We likely couldn't find a valid environment and everything is going to break
+}
+
 // envList returns the value of the given environment variable broken
 // into fields, using the default value when the variable is empty.
 func envList(key, def string) []string {
@@ -1887,9 +2171,20 @@ func envList(key, def string) []string {
 	return strings.Fields(v)
 }
 
+func msvcEnvList(key, def string) ([]string, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		v = def
+	}
+	return str.SplitQuotedFields(v)
+}
+
 // CFlags returns the flags to use when invoking the C, C++ or Fortran compilers, or cgo.
 func (b *Builder) CFlags(p *load.Package) (cppflags, cflags, cxxflags, fflags, ldflags []string) {
-	defaults := "-g -O2"
+	var defaults string
+	if cfg.BuildToolchainName != "msvc" {
+		defaults = "-g -O2"
+	}
 
 	cppflags = str.StringList(envList("CGO_CPPFLAGS", ""), p.CgoCPPFLAGS)
 	cflags = str.StringList(envList("CGO_CFLAGS", defaults), p.CgoCFLAGS)
@@ -1906,6 +2201,10 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 	cgoCPPFLAGS, cgoCFLAGS, cgoCXXFLAGS, cgoFFLAGS, cgoLDFLAGS := b.CFlags(p)
 	cgoCPPFLAGS = append(cgoCPPFLAGS, pcCFLAGS...)
 	cgoLDFLAGS = append(cgoLDFLAGS, pcLDFLAGS...)
+	cgoMSVCFlags := []string{"/c"}
+	cgoMSVCFlags = append(cgoMSVCFlags, "/Wall")
+	cgoMSVCFlags = append(cgoMSVCFlags, "/wd4100")
+	//cgoMSVCFlags = append(cgoMSVCFlags, "/Wall")
 	// If we are compiling Objective-C code, then we need to link against libobjc
 	if len(mfiles) > 0 {
 		cgoLDFLAGS = append(cgoLDFLAGS, "-lobjc")
@@ -1931,7 +2230,7 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 
 	// Allows including _cgo_export.h from .[ch] files in the package.
 	cgoCPPFLAGS = append(cgoCPPFLAGS, "-I", objdir)
-
+	cgoMSVCFlags = append(cgoMSVCFlags, "/I", objdir)
 	// cgo
 	// TODO: CGO_FLAGS?
 	gofiles := []string{objdir + "_cgo_gotypes.go"}
@@ -1981,6 +2280,10 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 		cgoflags = append(cgoflags, "-exportheader="+objdir+"_cgo_install.h")
 	}
 
+	if cfg.BuildToolchainName == "msvc" {
+		cgoflags = append(cgoflags, "-toolchain=msvc")
+	}
+
 	if err := b.run(a, p.Dir, p.ImportPath, cgoenv, cfg.BuildToolexec, cgoExe, "-objdir", objdir, "-importpath", p.ImportPath, cgoflags, "--", cgoCPPFLAGS, cgoCFLAGS, cgofiles); err != nil {
 		return nil, nil, err
 	}
@@ -1998,11 +2301,16 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 		return objdir + fmt.Sprintf("_x%03d.o", oseq)
 	}
 
-	// gcc
-	cflags := str.StringList(cgoCPPFLAGS, cgoCFLAGS)
+	cflags := []string{}
+	if cfg.BuildToolchainName == "msvc" {
+		cflags = cgoMSVCFlags
+	} else { // gcc
+		cflags = str.StringList(cgoCPPFLAGS, cgoCFLAGS)
+	}
+
 	for _, cfile := range cfiles {
 		ofile := nextOfile()
-		if err := b.gcc(a, p, a.Objdir, ofile, cflags, objdir+cfile); err != nil {
+		if err := b.toolchainCc(a, p, a.Objdir, ofile, cflags, objdir+cfile); err != nil {
 			return nil, nil, err
 		}
 		outObj = append(outObj, ofile)
@@ -2010,7 +2318,7 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 
 	for _, file := range gccfiles {
 		ofile := nextOfile()
-		if err := b.gcc(a, p, a.Objdir, ofile, cflags, file); err != nil {
+		if err := b.toolchainCc(a, p, a.Objdir, ofile, cflags, file); err != nil {
 			return nil, nil, err
 		}
 		outObj = append(outObj, ofile)
@@ -2019,7 +2327,7 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 	cxxflags := str.StringList(cgoCPPFLAGS, cgoCXXFLAGS)
 	for _, file := range gxxfiles {
 		ofile := nextOfile()
-		if err := b.gxx(a, p, a.Objdir, ofile, cxxflags, file); err != nil {
+		if err := b.toolchainGxx(a, p, a.Objdir, ofile, cxxflags, file); err != nil {
 			return nil, nil, err
 		}
 		outObj = append(outObj, ofile)
@@ -2027,7 +2335,7 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 
 	for _, file := range mfiles {
 		ofile := nextOfile()
-		if err := b.gcc(a, p, a.Objdir, ofile, cflags, file); err != nil {
+		if err := b.toolchainCc(a, p, a.Objdir, ofile, cflags, file); err != nil {
 			return nil, nil, err
 		}
 		outObj = append(outObj, ofile)
@@ -2043,7 +2351,7 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 	}
 
 	switch cfg.BuildToolchainName {
-	case "gc":
+	case "gc", "msvc":
 		importGo := objdir + "_cgo_import.go"
 		if err := b.dynimport(a, p, objdir, importGo, cgoExe, cflags, cgoLDFLAGS, outObj); err != nil {
 			return nil, nil, err
@@ -2071,7 +2379,7 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 func (b *Builder) dynimport(a *Action, p *load.Package, objdir, importGo, cgoExe string, cflags, cgoLDFLAGS, outObj []string) error {
 	cfile := objdir + "_cgo_main.c"
 	ofile := objdir + "_cgo_main.o"
-	if err := b.gcc(a, p, objdir, ofile, cflags, cfile); err != nil {
+	if err := b.toolchainCc(a, p, objdir, ofile, cflags, cfile); err != nil {
 		return err
 	}
 
@@ -2083,7 +2391,7 @@ func (b *Builder) dynimport(a *Action, p *load.Package, objdir, importGo, cgoExe
 	if (cfg.Goarch == "arm" && cfg.Goos == "linux") || cfg.Goos == "android" {
 		ldflags = append(ldflags, "-pie")
 	}
-	if err := b.gccld(p, objdir, dynobj, ldflags, linkobj); err != nil {
+	if err := b.toolchainLd(p, objdir, dynobj, ldflags, linkobj); err != nil {
 		return err
 	}
 

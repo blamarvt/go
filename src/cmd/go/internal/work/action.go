@@ -24,6 +24,7 @@ import (
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/load"
 	"cmd/internal/buildid"
+	"cmd/internal/msvc"
 )
 
 // A Builder holds global state about a build.
@@ -40,6 +41,8 @@ type Builder struct {
 
 	objdirSeq int // counter for NewObjdir
 	pkgSeq    int
+
+	msvcEnvironment *msvc.MSVCEnvironment
 
 	output    sync.Mutex
 	scriptDir string // current directory in printed script

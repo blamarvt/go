@@ -8,7 +8,7 @@ import (
 	"flag"
 
 	"cmd/go/internal/cfg"
-	"cmd/go/internal/str"
+	"cmd/internal/str"
 )
 
 // A StringsFlag is a command-line flag that interprets its argument

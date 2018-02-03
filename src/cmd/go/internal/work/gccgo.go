@@ -15,7 +15,7 @@ import (
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/load"
-	"cmd/go/internal/str"
+	"cmd/internal/str"
 )
 
 // The Gccgo toolchain.
@@ -458,6 +458,10 @@ func (tools gccgoToolchain) ld(b *Builder, root *Action, out, importcfg, mainpkg
 
 func (tools gccgoToolchain) ldShared(b *Builder, root *Action, toplevelactions []*Action, out, importcfg string, allactions []*Action) error {
 	return tools.link(b, root, out, importcfg, allactions, "shared", out)
+}
+
+func (tools gccgoToolchain) ccasm(b *Builder, a *Action, ofile, cfile string) error {
+	return tools.cc(b, a, ofile, cfile)
 }
 
 func (tools gccgoToolchain) cc(b *Builder, a *Action, ofile, cfile string) error {

@@ -9,6 +9,7 @@ package main
 
 import (
 	"bytes"
+	"cmd/internal/str"
 	"debug/dwarf"
 	"debug/elf"
 	"debug/macho"
@@ -179,8 +180,13 @@ func (p *Package) Translate(f *File) {
 // in the file f and saves relevant renamings in f.Name[name].Define.
 func (p *Package) loadDefines(f *File) {
 	var b bytes.Buffer
-	b.WriteString(builtinProlog)
+	if *toolchain == "msvc" {
+		b.WriteString(msvcBuiltinProlog)
+	} else {
+		b.WriteString(gccBuiltinProlog)
+	}
 	b.WriteString(f.Preamble)
+
 	stdout := p.gccDefines(b.Bytes())
 
 	for _, line := range strings.Split(stdout, "\n") {
@@ -308,7 +314,11 @@ func (p *Package) guessKinds(f *File) []*Name {
 	// whether name denotes a type or an expression.
 
 	var b bytes.Buffer
-	b.WriteString(builtinProlog)
+	if *toolchain == "msvc" {
+		b.WriteString(msvcBuiltinProlog)
+	} else {
+		b.WriteString(gccBuiltinProlog)
+	}
 	b.WriteString(f.Preamble)
 
 	for i, n := range names {
@@ -462,7 +472,11 @@ func (p *Package) loadDWARF(f *File, names []*Name) {
 	// for each entry in names and then dereference the type we
 	// learn for __cgo__i.
 	var b bytes.Buffer
-	b.WriteString(builtinProlog)
+	if *toolchain == "msvc" {
+		b.WriteString(msvcBuiltinProlog)
+	} else {
+		b.WriteString(gccBuiltinProlog)
+	}
 	b.WriteString(f.Preamble)
 	b.WriteString("#line 1 \"cgo-dwarf-inference\"\n")
 	for i, n := range names {
@@ -1229,11 +1243,11 @@ func (p *Package) rewriteRef(f *File) {
 // defaultCC is defined in zdefaultcc.go, written by cmd/dist.
 func (p *Package) gccBaseCmd() []string {
 	// Use $CC if set, since that's what the build uses.
-	if ret := strings.Fields(os.Getenv("CC")); len(ret) > 0 {
+	if ret, _ := str.SplitQuotedFields(os.Getenv("CC")); len(ret) > 0 {
 		return ret
 	}
 	// Try $GCC if set, since that's what we used to use.
-	if ret := strings.Fields(os.Getenv("GCC")); len(ret) > 0 {
+	if ret, _ := str.SplitQuotedFields(os.Getenv("GCC")); len(ret) > 0 {
 		return ret
 	}
 	return strings.Fields(defaultCC(goos, goarch))
@@ -1298,6 +1312,7 @@ func (p *Package) gccCmd() []string {
 	c = append(c, p.GccOptions...)
 	c = append(c, p.gccMachine()...)
 	c = append(c, "-") //read input from standard input
+
 	return c
 }
 
@@ -1633,6 +1648,39 @@ func (p *Package) gccErrors(stdin []byte) string {
 // Note that for some of the uses we expect useful data back
 // on standard error, but for those uses gcc must still exit 0.
 func runGcc(stdin []byte, args []string) (string, string) {
+	if *debugGcc {
+		fmt.Fprintf(os.Stderr, "$ %s <<EOF\n", strings.Join(args, " "))
+		os.Stderr.Write(stdin)
+		fmt.Fprint(os.Stderr, "EOF\n")
+	}
+	stdout, stderr, ok := run(stdin, args)
+	if *debugGcc {
+		os.Stderr.Write(stdout)
+		os.Stderr.Write(stderr)
+	}
+	if !ok {
+		os.Stderr.Write(stderr)
+		os.Exit(2)
+	}
+	return string(stdout), string(stderr)
+}
+
+// runToolchainCc runs the appropriate compiler for the specified
+// toolchain
+func runToolchainCc(stdin []byte, args []string) (string, string) {
+	if *toolchain == "msvc" {
+		return runMsvcCc(stdin, args)
+	}
+	return runGcc(stdin, args)
+}
+
+// runMsvcCc runs the msvc cl.exe command line args with stdin on standard input.
+// If the command exits with a non-zero exit status, runMsvcCc prints
+// details about what was run and exits.
+// Otherwise runMsvcCc returns the data written to standard output and standard error.
+// Note that for some of the uses we expect useful data back
+// on standard error, but for those uses cl.exe must still exit 0.
+func runMsvcCc(stdin []byte, args []string) (string, string) {
 	if *debugGcc {
 		fmt.Fprintf(os.Stderr, "$ %s <<EOF\n", strings.Join(args, " "))
 		os.Stderr.Write(stdin)

@@ -15,7 +15,7 @@ import (
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/load"
-	"cmd/go/internal/str"
+	"cmd/internal/str"
 )
 
 func init() {

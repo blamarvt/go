@@ -36,6 +36,12 @@ func (p *Package) writeDefs() {
 		defer f.Close()
 		fc = f
 	}
+	if *toolchain == "msvc" {
+		fh := creat(*objDir + "_cgo_main.h")
+		fmt.Fprintf(fh, "#define __SIZE_TYPE__ unsigned int\n")
+		fh.Close()
+	}
+
 	fm := creat(*objDir + "_cgo_main.c")
 
 	var gccgoInit bytes.Buffer
@@ -52,19 +58,24 @@ func (p *Package) writeDefs() {
 	fflg.Close()
 
 	// Write C main file for using gcc to resolve imports.
-	fmt.Fprintf(fm, "int main() { return 0; }\n")
+	if *toolchain == "msvc" {
+		fmt.Fprintf(fm, "#include \"_cgo_main.h\"\n")
+	}
+	fmt.Fprintf(fm, "int main(void) { return 0; }\n")
+
 	if *importRuntimeCgo {
 		fmt.Fprintf(fm, "void crosscall2(void(*fn)(void*, int, __SIZE_TYPE__), void *a, int c, __SIZE_TYPE__ ctxt) { }\n")
-		fmt.Fprintf(fm, "__SIZE_TYPE__ _cgo_wait_runtime_init_done() { return 0; }\n")
+		fmt.Fprintf(fm, "__SIZE_TYPE__ _cgo_wait_runtime_init_done(void) { return 0; }\n")
 		fmt.Fprintf(fm, "void _cgo_release_context(__SIZE_TYPE__ ctxt) { }\n")
 		fmt.Fprintf(fm, "char* _cgo_topofstack(void) { return (char*)0; }\n")
 	} else {
 		// If we're not importing runtime/cgo, we *are* runtime/cgo,
 		// which provides these functions. We just need a prototype.
 		fmt.Fprintf(fm, "void crosscall2(void(*fn)(void*, int, __SIZE_TYPE__), void *a, int c, __SIZE_TYPE__ ctxt);\n")
-		fmt.Fprintf(fm, "__SIZE_TYPE__ _cgo_wait_runtime_init_done();\n")
+		fmt.Fprintf(fm, "__SIZE_TYPE__ _cgo_wait_runtime_init_done(void);\n")
 		fmt.Fprintf(fm, "void _cgo_release_context(__SIZE_TYPE__);\n")
 	}
+
 	fmt.Fprintf(fm, "void _cgo_allocate(void *a, int c) { }\n")
 	fmt.Fprintf(fm, "void _cgo_panic(void *a, int c) { }\n")
 	fmt.Fprintf(fm, "void _cgo_reginit(void) { }\n")
@@ -215,7 +226,20 @@ func (p *Package) writeDefs() {
 
 	if callsMalloc && !*gccgo {
 		fmt.Fprint(fgo2, strings.Replace(cMallocDefGo, "PREFIX", cPrefix, -1))
-		fmt.Fprint(fgcc, strings.Replace(strings.Replace(cMallocDefC, "PREFIX", cPrefix, -1), "PACKED", p.packedAttribute(), -1))
+		def := strings.Replace(cMallocDefC, "PREFIX", cPrefix, -1)
+		if *toolchain == "msvc" {
+			def = strings.Replace(def, "PACKEDGCC", "", -1)
+			for strings.Index(def, "PACKED:start") > -1 {
+				def = def[0:strings.Index(def, "PACKED:start")] + p.packedAttribute(def[strings.Index(def, "PACKED:start")+12:strings.Index(def, "PACKED:end")]) + def[strings.Index(def, "PACKED:end")+10:]
+			}
+			fmt.Fprint(fgcc, def)
+		} else {
+			def = strings.Replace(def, "PACKED:start", "", -1)
+			def = strings.Replace(def, "PACKED:end", "", -1)
+			fmt.Fprint(fgcc, strings.Replace(def, "PACKEDGCC", p.gccPackedAttribute(), -1))
+		}
+
+		//fmt.Fprint(fgcc, strings.Replace(, "PACKED", p.packedAttribute(), -1))
 	}
 
 	if err := fgcc.Close(); err != nil {
@@ -541,7 +565,11 @@ func (p *Package) writeOutput(f *File, srcfile string) {
 
 	// While we process the vars and funcs, also write gcc output.
 	// Gcc output starts with the preamble.
-	fmt.Fprintf(fgcc, "%s\n", builtinProlog)
+	if *toolchain == "msvc" {
+		fmt.Fprintf(fgcc, "%s\n", msvcBuiltinProlog)
+	} else {
+		fmt.Fprintf(fgcc, "%s\n", gccBuiltinProlog)
+	}
 	fmt.Fprintf(fgcc, "%s\n", f.Preamble)
 	fmt.Fprintf(fgcc, "%s\n", gccProlog)
 	fmt.Fprintf(fgcc, "%s\n", tsanProlog)
@@ -608,7 +636,13 @@ func (p *Package) writeOutputFunc(fgcc *os.File, n *Name) {
 	// We're trying to write a gcc struct that matches gc's layout.
 	// Use packed attribute to force no padding in this struct in case
 	// gcc has different packing requirements.
-	fmt.Fprintf(fgcc, "\t%s %v *a = v;\n", ctype, p.packedAttribute())
+	if *toolchain == "msvc" {
+		fmt.Fprintf(fgcc, "#pragma warning(disable: 4189)\n")
+		fmt.Fprintf(fgcc, "\t%v\n", p.packedAttribute(ctype+"  *a = v;"))
+		fmt.Fprintf(fgcc, "#pragma warning(default: 4189)\n")
+	} else {
+		fmt.Fprintf(fgcc, "\t%v *a = v;\n", p.packedAttribute(ctype))
+	}
 	if n.FuncType.Result != nil {
 		// Save the stack top for use below.
 		fmt.Fprintf(fgcc, "\tchar *stktop = _cgo_topofstack();\n")
@@ -726,7 +760,25 @@ func (p *Package) writeGccgoOutputFunc(fgcc *os.File, n *Name) {
 // gcc wants to 8-align int64s, but gc does not.
 // Use __gcc_struct__ to work around http://gcc.gnu.org/PR52991 on x86,
 // and https://golang.org/issue/5603.
-func (p *Package) packedAttribute() string {
+func (p *Package) packedAttribute(attr string) string {
+	if *toolchain == "msvc" {
+		s := "#pragma pack(push, 1)\n" + attr + "\n#pragma pack(pop)\n"
+		return s
+	} else {
+		s := attr + " __attribute__((__packed__"
+		if !p.GccIsClang && (goarch == "amd64" || goarch == "386") {
+			s += ", __gcc_struct__"
+		}
+		return s + "))"
+	}
+}
+
+// gccPackedAttribute returns host compiler struct attribute that will be
+// used to match gc's struct layout. For example, on 386 Windows,
+// gcc wants to 8-align int64s, but gc does not.
+// Use __gcc_struct__ to work around http://gcc.gnu.org/PR52991 on x86,
+// and https://golang.org/issue/5603.
+func (p *Package) gccPackedAttribute() string {
 	s := "__attribute__((__packed__"
 	if !p.GccIsClang && (goarch == "amd64" || goarch == "386") {
 		s += ", __gcc_struct__"
@@ -744,7 +796,7 @@ func (p *Package) writeExports(fgo2, fm, fgcc, fgcch io.Writer) {
 	fmt.Fprintf(fgcc, "#include \"_cgo_export.h\"\n\n")
 
 	fmt.Fprintf(fgcc, "extern void crosscall2(void (*fn)(void *, int, __SIZE_TYPE__), void *, int, __SIZE_TYPE__);\n")
-	fmt.Fprintf(fgcc, "extern __SIZE_TYPE__ _cgo_wait_runtime_init_done();\n")
+	fmt.Fprintf(fgcc, "extern __SIZE_TYPE__ _cgo_wait_runtime_init_done(void);\n")
 	fmt.Fprintf(fgcc, "extern void _cgo_release_context(__SIZE_TYPE__);\n\n")
 	fmt.Fprintf(fgcc, "extern char* _cgo_topofstack(void);")
 	fmt.Fprintf(fgcc, "%s\n", tsanProlog)
@@ -853,7 +905,7 @@ func (p *Package) writeExports(fgo2, fm, fgcc, fgcch io.Writer) {
 		fmt.Fprintf(fgcc, "\n%s\n", s)
 		fmt.Fprintf(fgcc, "{\n")
 		fmt.Fprintf(fgcc, "\t__SIZE_TYPE__ _cgo_ctxt = _cgo_wait_runtime_init_done();\n")
-		fmt.Fprintf(fgcc, "\t%s %v a;\n", ctype, p.packedAttribute())
+		fmt.Fprintf(fgcc, "\t%v a;\n", p.packedAttribute(ctype))
 		if gccResult != "void" && (len(fntype.Results.List) > 1 || len(fntype.Results.List[0].Names) > 1) {
 			fmt.Fprintf(fgcc, "\t%s r;\n", gccResult)
 		}
@@ -1157,8 +1209,11 @@ func (p *Package) writeExportHeader(fgcch io.Writer) {
 	fmt.Fprintf(fgcch, "/* Start of preamble from import \"C\" comments.  */\n\n")
 	fmt.Fprintf(fgcch, "%s\n", p.Preamble)
 	fmt.Fprintf(fgcch, "\n/* End of preamble from import \"C\" comments.  */\n\n")
-
-	fmt.Fprintf(fgcch, "%s\n", p.gccExportHeaderProlog())
+	if *toolchain == "msvc" {
+		fmt.Fprintf(fgcch, "%s\n", p.msvcExportHeaderProlog())
+	} else {
+		fmt.Fprintf(fgcch, "%s\n", p.gccExportHeaderProlog())
+	}
 }
 
 // Return the package prefix when using gccgo.
@@ -1390,7 +1445,7 @@ static void _cgo_tsan_release() {
 // Set to yesTsanProlog if we see -fsanitize=thread in the flags for gcc.
 var tsanProlog = noTsanProlog
 
-const builtinProlog = `
+const gccBuiltinProlog = `
 #line 1 "cgo-builtin-prolog"
 #include <stddef.h> /* for ptrdiff_t and size_t below */
 
@@ -1410,6 +1465,27 @@ __attribute__ ((unused))
 static size_t _GoStringLen(_GoString_ s) { return s.n; }
 
 __attribute__ ((unused))
+static const char *_GoStringPtr(_GoString_ s) { return s.p; }
+`
+
+const msvcBuiltinProlog = `
+#line 1 "cgo-builtin-prolog"
+#include <stddef.h> /* for ptrdiff_t and size_t below */
+
+/* Define intgo when compiling with GCC.  */
+typedef ptrdiff_t intgo;
+
+typedef struct { const char *p; intgo n; } _GoString_;
+typedef struct { char *p; intgo n; intgo c; } _GoBytes_;
+_GoString_ GoString(char *p);
+_GoString_ GoStringN(char *p, int l);
+_GoBytes_ GoBytes(void *p, int n);
+char *CString(_GoString_);
+void *CBytes(_GoBytes_);
+void *_CMalloc(size_t);
+
+static size_t _GoStringLen(_GoString_ s) { return s.n; }
+
 static const char *_GoStringPtr(_GoString_ s) { return s.p; }
 `
 
@@ -1529,10 +1605,12 @@ func _cgo_cmalloc(p0 uint64) (r1 unsafe.Pointer) {
 const cMallocDefC = `
 CGO_NO_SANITIZE_THREAD
 void _cgoPREFIX_Cfunc__Cmalloc(void *v) {
+  PACKED:start
 	struct {
 		unsigned long long p0;
 		void *r1;
-	} PACKED *a = v;
+	} PACKEDGCC *a = v;
+  PACKED:end
 	void *ret;
 	_cgo_tsan_acquire();
 	ret = malloc(a->p0);
@@ -1665,6 +1743,10 @@ func (p *Package) gccExportHeaderProlog() string {
 	return strings.Replace(gccExportHeaderProlog, "GOINTBITS", fmt.Sprint(8*p.IntSize), -1)
 }
 
+func (p *Package) msvcExportHeaderProlog() string {
+	return strings.Replace(msvcExportHeaderProlog, "GOINTBITS", fmt.Sprint(8*p.IntSize), -1)
+}
+
 const gccExportHeaderProlog = `
 /* Start of boilerplate cgo prologue.  */
 #line 1 "cgo-gcc-export-header-prolog"
@@ -1709,6 +1791,51 @@ extern "C" {
 #endif
 `
 
+const msvcExportHeaderProlog = `
+/* Start of boilerplate cgo prologue.  */
+#line 1 "cgo-msvc-export-header-prolog"
+
+#ifndef GO_CGO_PROLOGUE_H
+#define GO_CGO_PROLOGUE_H
+#define __SIZE_TYPE__ unsigned int
+
+typedef signed char GoInt8;
+typedef unsigned char GoUint8;
+typedef short GoInt16;
+typedef unsigned short GoUint16;
+typedef int GoInt32;
+typedef unsigned int GoUint32;
+typedef long long GoInt64;
+typedef unsigned long long GoUint64;
+typedef GoIntGOINTBITS GoInt;
+typedef GoUintGOINTBITS GoUint;
+typedef __SIZE_TYPE__ GoUintptr;
+typedef float GoFloat32;
+typedef double GoFloat64;
+//typedef float _Complex GoComplex64;
+//typedef double _Complex GoComplex128;
+
+/*
+  static assertion to make sure the file is being used on architecture
+  at least with matching size of GoInt.
+*/
+typedef char _check_for_GOINTBITS_bit_pointer_matching_GoInt[sizeof(void*)==GOINTBITS/8 ? 1:-1];
+
+typedef _GoString_ GoString;
+typedef void *GoMap;
+typedef void *GoChan;
+typedef struct { void *t; void *v; } GoInterface;
+typedef struct { void *data; GoInt len; GoInt cap; } GoSlice;
+
+#endif
+
+/* End of boilerplate cgo prologue.  */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+`
+
 // gccExportHeaderEpilog goes at the end of the generated header file.
 const gccExportHeaderEpilog = `
 #ifdef __cplusplus
@@ -1730,5 +1857,5 @@ static void GoInit(void) {
 		runtime_iscgo = 1;
 }
 
-extern __SIZE_TYPE__ _cgo_wait_runtime_init_done() __attribute__ ((weak));
+extern __SIZE_TYPE__ _cgo_wait_runtime_init_done(void) __attribute__ ((weak));
 `

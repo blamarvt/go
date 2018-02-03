@@ -1,11 +1,15 @@
 // Copyright 2009 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
-
+#ifdef _MSC_VER
+#pragma warning(disable:4668 4255 4710) 
+#endif
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
-
+#ifdef _MSC_VER
+#pragma warning(default:4668 4255 4710) 
+#endif
 #define nil ((void*)0)
 #define nelem(x) (sizeof(x)/sizeof((x)[0]))
 
@@ -60,7 +64,7 @@ void _cgo_sys_thread_start(ThreadStart *ts);
  * If runtime.SetCgoTraceback is used to set a context function,
  * calls the context function and returns the context value.
  */
-uintptr_t _cgo_wait_runtime_init_done();
+uintptr_t _cgo_wait_runtime_init_done(void);
 
 /*
  * Call fn in the 6c world.
