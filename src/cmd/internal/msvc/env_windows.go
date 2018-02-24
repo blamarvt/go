@@ -6,7 +6,7 @@ package msvc
 
 import (
 	"fmt"
-	"internal/syscall/windows/registry"
+	"cmd/internal/msvc/registry"
 	"io/ioutil"
 	"os"
 	"os/exec"

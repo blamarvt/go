@@ -5,7 +5,7 @@
 package get
 
 import (
-	"cmd/go/internal/str"
+	"cmd/internal/str"
 	"reflect"
 	"strings"
 	"testing"
