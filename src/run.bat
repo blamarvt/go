@@ -40,7 +40,7 @@ call env.bat
 del env.bat
 echo.
 
-go tool dist test
+:: go tool dist test
 if errorlevel 1 goto fail
 echo.
 
