@@ -523,6 +523,9 @@ func pereloc1(arch *sys.Arch, out *ld.OutBuf, s *sym.Symbol, r *sym.Reloc, secto
 	case objabi.R_CALL,
 		objabi.R_PCREL:
 		v = ld.IMAGE_REL_AMD64_REL32
+	// We don't have a GOT in windows so what are we supposed to do here????
+	case objabi.R_GOTPCREL:
+	   v = ld.IMAGE_REL_AMD64_REL32
 	}
 
 	out.Write16(uint16(v))

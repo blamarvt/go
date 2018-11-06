@@ -498,14 +498,25 @@ func (f *peFile) addInitArray(ctxt *Link) *peSection {
 	sect.sizeOfRawData = uint32(size)
 	ctxt.Out.SeekSet(int64(sect.pointerToRawData))
 	sect.checkOffset(ctxt.Out.Offset())
-
-	init_entry := ctxt.Syms.Lookup(*flagEntrySymbol, 0)
-	addr := uint64(init_entry.Value) - init_entry.Sect.Vaddr
-	switch objabi.GOARCH {
-	case "386", "arm":
-		ctxt.Out.Write32(uint32(addr))
-	case "amd64":
-		ctxt.Out.Write64(addr)
+	
+	if ctxt.BuildMode == BuildModePlugin {
+		init_entry := ctxt.Syms.Lookup("go.link.addmoduledata", 0)
+		addr := uint64(init_entry.Value) - init_entry.Sect.Vaddr
+		switch objabi.GOARCH {
+			case "386":
+				ctxt.Out.Write32(uint32(addr))
+			case "amd64":
+				ctxt.Out.Write64(addr)
+		}
+	} else {
+		init_entry := ctxt.Syms.Lookup(*flagEntrySymbol, 0)
+		addr := uint64(init_entry.Value) - init_entry.Sect.Vaddr
+		switch objabi.GOARCH {
+		case "386", "arm":
+			ctxt.Out.Write32(uint32(addr))
+		case "amd64":
+			ctxt.Out.Write64(addr)
+		}
 	}
 	return sect
 }
@@ -704,7 +715,8 @@ func (f *peFile) writeSymbols(ctxt *Link) {
 			}
 		}
 		class := IMAGE_SYM_CLASS_EXTERNAL
-		if s.Version != 0 || s.Attr.VisibilityHidden() || s.Attr.Local() {
+		// Just expose everything for testing plugins
+		if s.Version != 0 || s.Attr.VisibilityHidden() || (ctxt.BuildMode != BuildModePlugin && s.Attr.Local()) {
 			class = IMAGE_SYM_CLASS_STATIC
 		}
 		f.writeSymbol(ctxt.Out, s, value, sect, typ, uint8(class))
